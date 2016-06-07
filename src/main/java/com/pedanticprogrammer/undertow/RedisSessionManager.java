@@ -7,12 +7,16 @@ import io.undertow.util.AttachmentKey;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.Transaction;
 
+import java.io.*;
 import java.net.URI;
+import java.nio.charset.Charset;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.Set;
 
 /**
- * A SessionManager that uses Redis to store session data.  Only supports Strings as session values right now...
+ * A SessionManager that uses Redis to store session data.  Sessions are stored as a Redis Hash and sessions attributes
+ * are stored directly in fields of that Hash
  *
  * @author Kent Smith
  */
@@ -68,7 +72,7 @@ public class RedisSessionManager implements SessionManager {
             }
             if (count++ == 100) {
                 //this should never happen
-                //but we guard against pathalogical session id generators to prevent an infinite loop
+                //but we guard against pathological session id generators to prevent an infinite loop
                 throw UndertowMessages.MESSAGES.couldNotGenerateUniqueSessionId();
             }
         }
@@ -181,29 +185,55 @@ public class RedisSessionManager implements SessionManager {
         }
 
         public Object getAttribute(String name) {
+            final String attribute = sessionManager.jedis.hget(sessionId, name);
+            if (attribute == null) {
+                return null;
+            }
+            byte[] attributeBytes = Base64.getDecoder().decode(attribute);
             bumpTimeout();
-            return sessionManager.jedis.hget(sessionId, name);
+            try (BufferedInputStream bis = new BufferedInputStream(new ByteArrayInputStream(attributeBytes));
+                 ObjectInputStream ois = new ObjectInputStream(bis)) {
+
+                return ois.readObject();
+            } catch (IOException | ClassNotFoundException e) {
+                e.printStackTrace();
+                return null;
+            }
         }
 
+
+        @Override
         public Set<String> getAttributeNames() {
             bumpTimeout();
             return sessionManager.jedis.hkeys(sessionId);
         }
 
+        @Override
         public Object setAttribute(String name, Object value) {
-            String existing = sessionManager.jedis.hget(sessionId, name);
-            sessionManager.jedis.hset(sessionId, name, value.toString());
-            if (existing == null) {
-                sessionManager.sessionListeners.attributeAdded(this, name, value);
-            } else {
-                sessionManager.sessionListeners.attributeUpdated(this, name, value, existing);
+            try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                 ObjectOutputStream oos = new ObjectOutputStream(new BufferedOutputStream(bos))) {
+                oos.writeObject(value);
+                oos.flush();
+
+                String existing = sessionManager.jedis.hget(sessionId, name);
+
+                sessionManager.jedis.hset(sessionId, name, Base64.getEncoder().encodeToString(bos.toByteArray()));
+                if (existing == null) {
+                    sessionManager.sessionListeners.attributeAdded(this, name, value);
+                } else {
+                    sessionManager.sessionListeners.attributeUpdated(this, name, value, existing);
+                }
+                bumpTimeout();
+                return value;
+            } catch (IOException e) {
+                e.printStackTrace();
+                return null;
             }
-            bumpTimeout();
-            return value;
         }
 
+        @Override
         public Object removeAttribute(String name) {
-            final Object existing = sessionManager.jedis.hget(sessionId, name);
+            final Object existing = getAttribute(name);
             sessionManager.jedis.hdel(sessionId, name);
             sessionManager.sessionListeners.attributeRemoved(this, name, existing);
             bumpTimeout();
@@ -211,6 +241,7 @@ public class RedisSessionManager implements SessionManager {
             return existing;
         }
 
+        @Override
         public void invalidate(HttpServerExchange exchange) {
             Transaction transaction = sessionManager.jedis.multi();
             transaction.del(sessionId);
@@ -222,10 +253,12 @@ public class RedisSessionManager implements SessionManager {
             }
         }
 
+        @Override
         public SessionManager getSessionManager() {
             return sessionManager;
         }
 
+        @Override
         public String changeSessionId(HttpServerExchange exchange, SessionConfig config) {
             final String oldId = sessionId;
             String newId = sessionManager.sessionIdGenerator.createSessionId();
