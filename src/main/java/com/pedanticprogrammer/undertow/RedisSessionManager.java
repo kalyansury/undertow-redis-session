@@ -5,6 +5,8 @@ import io.undertow.server.HttpServerExchange;
 import io.undertow.server.session.*;
 import io.undertow.util.AttachmentKey;
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
 import redis.clients.jedis.Transaction;
 
 import java.io.*;
@@ -30,7 +32,7 @@ public class RedisSessionManager implements SessionManager {
     private final SessionListeners sessionListeners = new SessionListeners();
     private volatile int defaultSessionTimeout = 30 * 60;
     private final SessionConfig sessionConfig;
-    private final Jedis jedis;
+    private final JedisPool jedisPool;
 
     private volatile long startTime;
 
@@ -44,7 +46,8 @@ public class RedisSessionManager implements SessionManager {
         this.sessionIdGenerator = sessionIdGenerator;
         this.sessionConfig = sessionConfig;
 
-        jedis = new Jedis(redisUri);
+        JedisPoolConfig jedisPoolConfig = new JedisPoolConfig();
+        jedisPool = new JedisPool(jedisPoolConfig, redisUri);
     }
 
     public String getDeploymentName() {
@@ -65,10 +68,13 @@ public class RedisSessionManager implements SessionManager {
         }
         String sessionId = sessionConfig.findSessionId(serverExchange);
         int count = 0;
+
         while (sessionId == null) {
             sessionId = sessionIdGenerator.createSessionId();
-            if (jedis.exists(sessionId)) {
-                sessionId = null;
+            try (Jedis jedis = jedisPool.getResource()) {
+                if (jedis.exists(sessionId)) {
+                    sessionId = null;
+                }
             }
             if (count++ == 100) {
                 //this should never happen
@@ -77,7 +83,9 @@ public class RedisSessionManager implements SessionManager {
             }
         }
         final long created = System.currentTimeMillis();
-        jedis.set(sessionId + CREATED_FIELD, String.valueOf(created));
+        try (Jedis jedis = jedisPool.getResource()) {
+            jedis.set(sessionId + CREATED_FIELD, String.valueOf(created));
+        }
         final SessionImpl session = new SessionImpl(sessionId, created, defaultSessionTimeout,
                 sessionConfig, this);
 
@@ -103,12 +111,14 @@ public class RedisSessionManager implements SessionManager {
         if (sessionId == null) {
             return null;
         }
-        if (jedis.exists(sessionId)) {
-            long created = Long.valueOf(jedis.get(sessionId + CREATED_FIELD));
-            int ttl = jedis.ttl(sessionId).intValue();
-            return new SessionImpl(sessionId, created, ttl, sessionConfig, this);
-        } else {
-            return null;
+        try (Jedis jedis = jedisPool.getResource()) {
+            if (jedis.exists(sessionId)) {
+                long created = Long.valueOf(jedis.get(sessionId + CREATED_FIELD));
+                int ttl = jedis.ttl(sessionId).intValue();
+                return new SessionImpl(sessionId, created, ttl, sessionConfig, this);
+            } else {
+                return null;
+            }
         }
     }
 
@@ -134,7 +144,9 @@ public class RedisSessionManager implements SessionManager {
     }
 
     public Set<String> getAllSessions() {
-        return jedis.keys("*");
+        try (Jedis jedis = jedisPool.getResource()) {
+            return jedis.keys("*");
+        }
     }
 
     // TODO: support statistics
@@ -172,7 +184,9 @@ public class RedisSessionManager implements SessionManager {
         }
 
         public long getLastAccessedTime() {
-            return System.currentTimeMillis() - ((maxInactiveInterval * 100) - sessionManager.jedis.pttl(sessionId));
+            try (Jedis jedis = sessionManager.jedisPool.getResource()) {
+                return System.currentTimeMillis() - ((maxInactiveInterval * 100) - jedis.pttl(sessionId));
+            }
         }
 
         public void setMaxInactiveInterval(final int interval) {
@@ -185,12 +199,22 @@ public class RedisSessionManager implements SessionManager {
         }
 
         public Object getAttribute(String name) {
-            final String attribute = sessionManager.jedis.hget(sessionId, name);
-            if (attribute == null) {
+            try (Jedis jedis = sessionManager.jedisPool.getResource()) {
+                final String attribute = jedis.hget(sessionId, name);
+
+                if (attribute == null) {
+                    return null;
+                }
+                bumpTimeout();
+                return deserialize(attribute);
+            }
+        }
+
+        private Object deserialize(String data) {
+            if (data == null) {
                 return null;
             }
-            byte[] attributeBytes = Base64.getDecoder().decode(attribute);
-            bumpTimeout();
+            byte[] attributeBytes = Base64.getDecoder().decode(data);
             try (BufferedInputStream bis = new BufferedInputStream(new ByteArrayInputStream(attributeBytes));
                  ObjectInputStream ois = new ObjectInputStream(bis)) {
 
@@ -201,11 +225,12 @@ public class RedisSessionManager implements SessionManager {
             }
         }
 
-
         @Override
         public Set<String> getAttributeNames() {
             bumpTimeout();
-            return sessionManager.jedis.hkeys(sessionId);
+            try (Jedis jedis = sessionManager.jedisPool.getResource()) {
+                return jedis.hkeys(sessionId);
+            }
         }
 
         @Override
@@ -215,9 +240,12 @@ public class RedisSessionManager implements SessionManager {
                 oos.writeObject(value);
                 oos.flush();
 
-                String existing = sessionManager.jedis.hget(sessionId, name);
+                Object existing;
+                try (Jedis jedis = sessionManager.jedisPool.getResource()) {
+                    existing = deserialize(jedis.hget(sessionId, name));
 
-                sessionManager.jedis.hset(sessionId, name, Base64.getEncoder().encodeToString(bos.toByteArray()));
+                    jedis.hset(sessionId, name, Base64.getEncoder().encodeToString(bos.toByteArray()));
+                }
                 if (existing == null) {
                     sessionManager.sessionListeners.attributeAdded(this, name, value);
                 } else {
@@ -234,7 +262,9 @@ public class RedisSessionManager implements SessionManager {
         @Override
         public Object removeAttribute(String name) {
             final Object existing = getAttribute(name);
-            sessionManager.jedis.hdel(sessionId, name);
+            try (Jedis jedis = sessionManager.jedisPool.getResource()) {
+                jedis.hdel(sessionId, name);
+            }
             sessionManager.sessionListeners.attributeRemoved(this, name, existing);
             bumpTimeout();
 
@@ -243,10 +273,12 @@ public class RedisSessionManager implements SessionManager {
 
         @Override
         public void invalidate(HttpServerExchange exchange) {
-            Transaction transaction = sessionManager.jedis.multi();
-            transaction.del(sessionId);
-            transaction.del(sessionId + CREATED_FIELD);
-            transaction.exec();
+            try (Jedis jedis = sessionManager.jedisPool.getResource()) {
+                Transaction transaction = jedis.multi();
+                transaction.del(sessionId);
+                transaction.del(sessionId + CREATED_FIELD);
+                transaction.exec();
+            }
 
             if (exchange != null) {
                 sessionConfig.clearSession(exchange, this.getId());
@@ -263,18 +295,22 @@ public class RedisSessionManager implements SessionManager {
             final String oldId = sessionId;
             String newId = sessionManager.sessionIdGenerator.createSessionId();
             this.sessionId = newId;
-            sessionManager.jedis.rename(oldId, newId);
+            try (Jedis jedis = sessionManager.jedisPool.getResource()) {
+                jedis.rename(oldId, newId);
+            }
             config.setSessionId(exchange, this.getId());
             sessionManager.sessionListeners.sessionIdChanged(this, oldId);
             return newId;
         }
 
         private void bumpTimeout() {
-            Transaction transaction = sessionManager.jedis.multi();
-            transaction.expire(sessionId, maxInactiveInterval);
-            transaction.expire(sessionId + CREATED_FIELD, maxInactiveInterval);
+            try (Jedis jedis = sessionManager.jedisPool.getResource()) {
+                Transaction transaction = jedis.multi();
+                transaction.expire(sessionId, maxInactiveInterval);
+                transaction.expire(sessionId + CREATED_FIELD, maxInactiveInterval);
 
-            transaction.exec();
+                transaction.exec();
+            }
         }
     }
 }

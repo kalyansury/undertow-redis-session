@@ -6,7 +6,7 @@
 
     <groupId>com.pedanticprogrammer.undertow</groupId>
     <artifactId>undertow-redis-session</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <name>undertow-redis-session</name>
     <description>A SessionManager for Undertow that uses Redis to store session data.</description>
     <packaging>jar</packaging>
