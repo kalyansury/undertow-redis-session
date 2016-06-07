@@ -27,20 +27,19 @@ import static org.junit.Assert.assertEquals;
 
 public class RedisSessionManagerIT {
     private static Jedis JEDIS;
-    private static URI REDIS_URI;
     private static SessionManager sessionManager;
     private static Undertow server;
     private static OkHttpClient client = new OkHttpClient();
 
     @BeforeClass
     public static void init() throws URISyntaxException {
-        REDIS_URI = new URI("redis://localhost:6379/0");
-        JEDIS = new Jedis();
+        URI redisUri = new URI("redis://localhost:6379/0");
+        JEDIS = new Jedis(redisUri);
 
         SessionCookieConfig sessionConfig = new SessionCookieConfig();
         sessionConfig.setCookieName("session");
 
-        sessionManager = new RedisSessionManager(REDIS_URI, sessionConfig);
+        sessionManager = new RedisSessionManager(redisUri, sessionConfig);
 
         server = Undertow.builder()
                 .addHttpListener(9876, "localhost")
