@@ -90,6 +90,7 @@ public class RedisSessionManager implements SessionManager {
                 sessionConfig, this);
 
         sessionConfig.setSessionId(serverExchange, session.getId());
+        session.bumpTimeout();
         sessionListeners.sessionCreated(session, serverExchange);
         serverExchange.putAttachment(NEW_SESSION, session);
 
