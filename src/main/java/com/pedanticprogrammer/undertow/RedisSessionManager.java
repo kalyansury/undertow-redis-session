@@ -59,7 +59,7 @@ public class RedisSessionManager implements SessionManager {
     }
 
     public void stop() {
-        // Do nothing for now...
+        jedisPool.destroy();
     }
 
     public Session createSession(final HttpServerExchange serverExchange, final SessionConfig sessionConfig) {
